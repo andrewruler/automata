@@ -1,3 +1,17 @@
+/**
+ * =============================================================================
+ * PLANNER + CRITIC — the two LLM roles that drive the agent loop
+ * =============================================================================
+ *
+ * **`planNextAction`** (planner): “Given what I see on the page and recent history,
+ * what is the **single** next browser action?” Returns `PlannedAction` JSON.
+ *
+ * **`critiqueStep`** (critic): “Given before/after snapshots and what we tried,
+ * should we **continue**, declare **success**, or stop (**blocked** / **failed**)?”
+ *
+ * Both use **Structured Outputs** (JSON Schema). Schemas are `as const` in TS but cast to
+ * `Record<string, unknown>` when passed to the OpenAI client (SDK typing requirement).
+ */
 import {
   AgentTask,
   CriticVerdict,
@@ -7,6 +21,7 @@ import {
 } from "./types.js";
 import { JsonThread } from "./llm.js";
 
+/** JSON Schema for the planner’s reply — must stay in sync with `PlannedAction` in `types.ts`. */
 const actionSchema = {
   type: "object",
   properties: {
@@ -27,6 +42,7 @@ const actionSchema = {
   additionalProperties: false,
 } as const;
 
+/** JSON Schema for the critic’s reply — must stay in sync with `CriticVerdict`. */
 const criticSchema = {
   type: "object",
   properties: {
@@ -42,6 +58,22 @@ const criticSchema = {
   additionalProperties: false,
 } as const;
 
+/**
+ * Asks the planner model for the next single step.
+ *
+ * Input payload includes:
+ * - Task metadata (goal, allowed domains, credential **key names only** — never values),
+ * - Current `observation` from `observePage`,
+ * - Last few `history` entries so it can recover from errors.
+ *
+ * After the API returns, runs **`validateAction`** so invalid combinations (e.g. `click` without
+ * `selector`) throw **before** Playwright runs.
+ *
+ * @param thread — Planner’s `JsonThread` (separate from critic).
+ * @param task — Original task definition (domains, credentials map for key lookup, etc.).
+ * @param observation — Current `PageObservation` (“before” snapshot in the loop).
+ * @param history — All completed steps so far in this run.
+ */
 export async function planNextAction(
   thread: JsonThread,
   task: AgentTask,
@@ -50,7 +82,7 @@ export async function planNextAction(
 ): Promise<PlannedAction> {
   const plan = await thread.ask<PlannedAction>({
     schemaName: "browser_next_action",
-    schema: actionSchema,
+    schema: actionSchema as unknown as Record<string, unknown>,
     instructions: [
       "You are a browser automation planner.",
       "Return exactly one next action as JSON.",
@@ -88,6 +120,19 @@ export async function planNextAction(
   return plan;
 }
 
+/**
+ * Asks the critic model to judge the last executed step.
+ *
+ * Uses:
+ * - `before` / `after` observations,
+ * - The `action` we attempted,
+ * - `executionResult` text (success message or error string from `executeAction`),
+ * - Recent `history` for context.
+ *
+ * The returned `status` tells `agent.ts` whether to keep looping or return success/failure.
+ *
+ * @param thread — Critic’s `JsonThread` (not the planner’s).
+ */
 export async function critiqueStep(
   thread: JsonThread,
   task: AgentTask,
@@ -99,7 +144,7 @@ export async function critiqueStep(
 ): Promise<CriticVerdict> {
   return await thread.ask<CriticVerdict>({
     schemaName: "browser_step_critic",
-    schema: criticSchema,
+    schema: criticSchema as unknown as Record<string, unknown>,
     instructions: [
       "You are a browser automation critic.",
       "Judge whether the last browser action advanced the task.",
@@ -130,6 +175,14 @@ export async function critiqueStep(
   });
 }
 
+/**
+ * Programmatic guardrails **after** the model returns JSON but **before** Playwright runs.
+ * Catches incomplete actions that still satisfied the JSON schema.
+ *
+ * @param action — Parsed `PlannedAction` from the planner.
+ * @param task — Used to verify `credentialKey` exists in `task.credentials`.
+ * @throws Error describing what was missing or inconsistent.
+ */
 function validateAction(action: PlannedAction, task: AgentTask) {
   if (!action.reason) throw new Error("Action missing reason");
 

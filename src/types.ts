@@ -1,5 +1,24 @@
+/**
+ * =============================================================================
+ * SHARED DATA SHAPES — how information flows between modules
+ * =============================================================================
+ *
+ * Execution order reminder (see `docs/WORKFLOW.md`):
+ *   `AgentTask` (input) → `PageObservation` (observer) → `PlannedAction` (planner)
+ *   → Playwright (executor) → `CriticVerdict` (critic) → `StepRecord` (history)
+ *   → repeat until `ExecutionResult`.
+ *
+ * Playwright’s own types (`Page`, `Browser`, …) live in the `playwright` package, not here.
+ */
+
 export type CredentialMap = Record<string, string>;
 
+/**
+ * Definition of one automation job passed into `runLLMAgentTask`.
+ *
+ * - `allowedDomains` is enforced by `ensureAllowedUrl` (hostname allowlist).
+ * - `credentials` values are **never** sent to the LLM; only keys appear in planner payload.
+ */
 export type AgentTask = {
   name: string;
   goal: string;
@@ -11,6 +30,10 @@ export type AgentTask = {
   successHints?: string[];
 };
 
+/**
+ * Compact “what’s on the page” structure produced by `observePage`.
+ * The planner and critic both consume this (before/after snapshots).
+ */
 export type PageObservation = {
   url: string;
   title: string;
@@ -28,6 +51,12 @@ export type PageObservation = {
   bodyTextExcerpt: string;
 };
 
+/**
+ * One step requested by the planner. `executor.ts` dispatches on `actionType`.
+ *
+ * - `selector`: Playwright locator string (CSS / text / role — see planner instructions).
+ * - `credentialKey`: must exist in `task.credentials`; actual value filled locally.
+ */
 export type PlannedAction = {
   actionType: "goto" | "click" | "fill" | "press" | "wait" | "done";
   reason: string;
@@ -40,6 +69,10 @@ export type PlannedAction = {
   doneMessage?: string;
 };
 
+/**
+ * Critic output after each executed step (except pure `done` planner exits handled earlier).
+ * `agent.ts` uses `status` to decide whether to continue the loop or return.
+ */
 export type CriticVerdict = {
   status: "continue" | "success" | "blocked" | "failed";
   summary: string;
@@ -47,6 +80,10 @@ export type CriticVerdict = {
   nextAdvice: string;
 };
 
+/**
+ * One row of memory: what we saw, what we did, what happened, what the critic said.
+ * The last N entries are embedded in planner/critic payloads (`recentHistory`).
+ */
 export type StepRecord = {
   step: number;
   observation: PageObservation;
@@ -58,6 +95,9 @@ export type StepRecord = {
   criticSummary?: string;
 };
 
+/**
+ * Final return value from `runLLMAgentTask` printed by `index.ts`.
+ */
 export type ExecutionResult = {
   success: boolean;
   stepsCompleted: number;
@@ -65,5 +105,6 @@ export type ExecutionResult = {
   lastUrl?: string;
   screenshots: string[];
   errors: string[];
+  /** Playwright storage state JSON path (cookies/localStorage snapshot), if saved. */
   authStatePath?: string;
 };

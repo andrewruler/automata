@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "dev": "tsc && node dist/index.js"
+    "dev": "tsc && node dist/index.js",
+    "install:chrome": "playwright install chrome"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

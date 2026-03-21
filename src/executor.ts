@@ -1,8 +1,36 @@
+/**
+ * =============================================================================
+ * ACTION EXECUTION — trusted bridge from LLM JSON to Playwright
+ * =============================================================================
+ *
+ * The model only **describes** what to do (`PlannedAction`). This file is the only place
+ * that actually calls `page.goto`, `click`, etc. That separation keeps credentials and
+ * navigation policy under your control (`guardrails`, `task.credentials`).
+ *
+ * Called once per loop iteration from `agent.ts` **unless** the planner returned `done`.
+ */
 import { Page } from "playwright";
 import { PlannedAction, AgentTask } from "./types.js";
 import { Logger } from "./logger.js";
 import { ensureAllowedUrl } from "./guardrails.js";
 
+/**
+ * Executes one `PlannedAction` on the given Playwright `Page`.
+ *
+ * Order of operations (typical case):
+ *   1. Switch on `action.actionType` and run the matching Playwright API.
+ *   2. After navigation-like actions, `settle` waits briefly for SPA updates.
+ *   3. Re-run `ensureAllowedUrl` on the **current** URL (catch unexpected redirects off-domain).
+ *   4. Save a full-page PNG under the run directory and return its path.
+ *
+ * Special case: `done` returns immediately **without** a screenshot (nothing to “do” in the page).
+ *
+ * @param page — Tab to automate.
+ * @param task — Supplies `allowedDomains` and `credentials` for fills.
+ * @param action — One planner output (already validated by `validateAction`).
+ * @param logger — For console + disk log lines and screenshot path generation.
+ * @returns Human-readable result string for the critic, optional screenshot path.
+ */
 export async function executeAction(
   page: Page,
   task: AgentTask,
@@ -75,6 +103,12 @@ export async function executeAction(
   };
 }
 
+/**
+ * Best-effort wait for the document to settle after a click/navigation.
+ * Many SPAs update the DOM asynchronously; a fixed short delay reduces flaky “observe too early”.
+ *
+ * @param page — Current tab.
+ */
 async function settle(page: Page) {
   try {
     await page.waitForLoadState("domcontentloaded", { timeout: 5000 });

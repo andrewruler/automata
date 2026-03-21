@@ -1,5 +1,22 @@
+/**
+ * =============================================================================
+ * AGENT ORCHESTRATION — the full “sense → think → act → review” loop
+ * =============================================================================
+ *
+ * Called from `index.ts` via `runLLMAgentTask(task)`.
+ *
+ * One **iteration** (one value of `step`) does:
+ *   (1) Observe page  →  (2) Planner LLM picks next action  →  (3) Execute with Playwright
+ *   →  (4) Observe again  →  (5) Critic LLM judges outcome  →  (6) Record history
+ *
+ * The planner sees past steps through `history` and its own OpenAI thread (`JsonThread`).
+ * The critic has a separate thread so its “conversation” doesn’t collide with planning.
+ *
+ * Stops when: planner says `done`, critic says `success` / `blocked` / `failed`,
+ * or limits (`maxSteps`, `deadlineSeconds`) hit.
+ */
 import path from "node:path";
-import { chromium } from "playwright";
+import { createBrowserSession } from "./chrome.js";
 import { Logger } from "./logger.js";
 import { observePage } from "./observer.js";
 import { JsonThread } from "./llm.js";
@@ -8,32 +25,49 @@ import { executeAction } from "./executor.js";
 import { AgentTask, ExecutionResult, StepRecord } from "./types.js";
 import { ensureAllowedUrl } from "./guardrails.js";
 
+/**
+ * Runs a single browser automation “episode” for the given task.
+ *
+ * Steps inside this function:
+ * 1. Create logger + planner/critic LLM threads.
+ * 2. Open browser (`createBrowserSession`) — Chrome per `CHROME_*` env.
+ * 3. Guard + navigate to `task.startUrl`.
+ * 4. Loop: observe → plan → [maybe execute] → observe → critique → append history.
+ * 5. `finally`: always `dispose()` the browser session (CDP disconnect vs full close).
+ *
+ * @param task — Goal, URLs, domain allowlist, timeouts, optional credential map.
+ * @returns Summary for the user: success flag, step count, paths to screenshots, errors, optional auth state file.
+ */
 export async function runLLMAgentTask(task: AgentTask): Promise<ExecutionResult> {
+  // --- Setup: logging and two independent LLM conversation chains ---
   const logger = new Logger(task.name);
   const planner = new JsonThread();
   const critic = new JsonThread();
 
   const deadline = Date.now() + task.deadlineSeconds * 1000;
-  const browser = await chromium.launch({
-    headless: process.env.HEADLESS === "true",
-  });
+  const session = await createBrowserSession();
+  const { context, page, mode, dispose } = session;
+  logger.log(`browser session: ${mode} (HEADLESS=${process.env.HEADLESS === "true"})`);
 
-  const context = await browser.newContext({
-    viewport: { width: 1440, height: 960 },
-  });
-
-  const page = await context.newPage();
+  /** Grows by one entry per executed step; fed back into `planNextAction` so the model sees what happened. */
   const history: StepRecord[] = [];
 
   try {
+    // --- Phase: land on the starting URL (before the main loop) ---
     ensureAllowedUrl(task.startUrl, task.allowedDomains);
     await page.goto(task.startUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
 
+    // =================================================================
+    // MAIN LOOP — each pass is one “agent step” (may include LLM + browser)
+    // =================================================================
     for (let step = 1; step <= task.maxSteps && Date.now() < deadline; step++) {
+      // --- (1) Perceive: structured text snapshot of the current DOM (no screenshots here yet) ---
       const before = await observePage(page);
 
+      // --- (2) Decide: ask planner for exactly one JSON action ---
       const action = await planNextAction(planner, task, before, history);
 
+      // --- Early exit: planner believes the mission is complete (no browser action this turn) ---
       if (action.actionType === "done") {
         const authStatePath = path.join(logger.dir, "storage-state.json");
         await context.storageState({ path: authStatePath });
@@ -48,6 +82,7 @@ export async function runLLMAgentTask(task: AgentTask): Promise<ExecutionResult>
         };
       }
 
+      // --- (3) Act: run Playwright; failures are caught so the critic can still run ---
       let execMessage = "";
       let screenshot: string | undefined;
 
@@ -61,8 +96,10 @@ export async function runLLMAgentTask(task: AgentTask): Promise<ExecutionResult>
         execMessage = `Execution error: ${msg}`;
       }
 
+      // --- (4) Perceive again: see what changed after the action ---
       const after = await observePage(page);
 
+      // --- (5) Review: second LLM call scores the step ---
       const verdict = await critiqueStep(
         critic,
         task,
@@ -73,6 +110,7 @@ export async function runLLMAgentTask(task: AgentTask): Promise<ExecutionResult>
         history
       );
 
+      // --- (6) Remember: store this step for future planner turns ---
       history.push({
         step,
         observation: before,
@@ -88,6 +126,7 @@ export async function runLLMAgentTask(task: AgentTask): Promise<ExecutionResult>
         `step ${step}: ${action.actionType} -> ${verdict.status} | ${verdict.summary}`
       );
 
+      // --- Stop on critic declaring overall success (e.g. goal met on screen) ---
       if (verdict.status === "success") {
         const authStatePath = path.join(logger.dir, "storage-state.json");
         await context.storageState({ path: authStatePath });
@@ -102,6 +141,7 @@ export async function runLLMAgentTask(task: AgentTask): Promise<ExecutionResult>
         };
       }
 
+      // --- Stop on hard failure modes (CAPTCHA, etc.) ---
       if (verdict.status === "blocked" || verdict.status === "failed") {
         return {
           success: false,
@@ -112,8 +152,11 @@ export async function runLLMAgentTask(task: AgentTask): Promise<ExecutionResult>
           errors: logger.errors,
         };
       }
+
+      // --- `continue`: loop again with updated `history` ---
     }
 
+    // --- Ran out of steps or time without explicit success/stop from critic ---
     return {
       success: false,
       stepsCompleted: history.length,
@@ -123,7 +166,7 @@ export async function runLLMAgentTask(task: AgentTask): Promise<ExecutionResult>
       errors: logger.errors,
     };
   } finally {
-    await context.close().catch(() => {});
-    await browser.close().catch(() => {});
+    // Always release Playwright resources (behavior depends on CDP vs launch — see `chrome.ts`).
+    await dispose();
   }
 }
