@@ -22,6 +22,32 @@ import {
 } from "./types.js";
 import { JsonThread } from "./llm.js";
 
+/**
+ * Detects hard blockers that should be treated as blocked rather than retried.
+ * CAPTCHA is excluded here because it may be handled by a specialized solver flow elsewhere.
+ */
+function detectHardBlockers(observation: ObservationBundle): string | null {
+  const combined = [
+    observation.html,
+    typeof observation.vision === "string" ? observation.vision : "",
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .toLowerCase();
+
+  const blockerPatterns: Array<{ pattern: RegExp; label: string }> = [
+    { pattern: /phone verification|verify your phone|enter verification code/, label: "Phone verification required" },
+    { pattern: /email verification|check your email to verify/, label: "Email verification required" },
+    { pattern: /permission denied|access denied|forbidden|not authorized/, label: "Access denied" },
+  ];
+
+  for (const { pattern, label } of blockerPatterns) {
+    if (pattern.test(combined)) return label;
+  }
+
+  return null;
+}
+
 /** JSON Schema for the planner reply. Keep in sync with `PlannedAction` in `types.ts`. */
 const actionSchema = {
   type: "object",
@@ -93,37 +119,6 @@ const criticSchema = {
   additionalProperties: false,
 } as const;
 
-/**
- * Detects hard blockers that should be treated as blocked rather than retried.
- * This does not attempt to solve or bypass them.
- */
-function detectHardBlockers(observation: ObservationBundle): string | null {
-  const combined = [
-    observation.html,
-    typeof observation.vision === "string" ? observation.vision : "",
-  ]
-    .filter(Boolean)
-    .join("\n")
-    .toLowerCase();
-
-  const blockerPatterns: Array<{ pattern: RegExp; label: string }> = [
-    { pattern: /captcha|recaptcha|hcaptcha|cf-turnstile|turnstile/, label: "CAPTCHA detected" },
-    { pattern: /verify you are human|prove you are human|human verification/, label: "Human verification detected" },
-    { pattern: /phone verification|verify your phone|enter verification code/, label: "Phone verification required" },
-    { pattern: /email verification|check your email to verify/, label: "Email verification required" },
-    { pattern: /permission denied|access denied|forbidden|not authorized/, label: "Access denied" },
-  ];
-
-  for (const { pattern, label } of blockerPatterns) {
-    if (pattern.test(combined)) return label;
-  }
-
-  return null;
-}
-
-/**
- * Asks the planner model for the next single step.
- */
 export async function planNextAction(
   thread: JsonThread,
   task: AgentTask,
@@ -135,7 +130,7 @@ export async function planNextAction(
   if (hardBlocker) {
     return {
       actionType: "wait",
-      reason: `${hardBlocker}. Do not attempt to bypass it; let the critic classify the run as blocked.`,
+      reason: `${hardBlocker}. Let the critic classify the run as blocked.`,
       url: null,
       selector: null,
       executionMode: null,
@@ -166,7 +161,7 @@ export async function planNextAction(
       'Avoid using undesired global focus commands such as ArrowUp/ArrowDown/Enter unless the target element is clearly a keyboard-navigable combobox and no stable options are available.',
       'When using vision mode, include normalized coordinates in `bbox` or `clickPoint` (values 0–1 relative to viewport width/height).',
       "Do not invent elements that are not plausibly present in the observation.",
-      "Treat CAPTCHA, human verification, email verification, and phone verification as hard blockers rather than challenges to solve.",
+      "Treat email verification, phone verification, and access denial as hard blockers. CAPTCHA or human verification may be handled by a specialized solver flow elsewhere in the system.",
       "Use actionType='done' only when the task is truly complete.",
       "If the task is blocked or required data is missing, do not use done; keep the step minimal and let the critic classify blocked/failed after the attempt.",
       "Use observation.html as primary context; use observation.vision only when present.",
@@ -197,9 +192,6 @@ export async function planNextAction(
   return plan;
 }
 
-/**
- * Asks the critic model to judge the last executed step.
- */
 export async function critiqueStep(
   thread: JsonThread,
   task: AgentTask,
@@ -227,7 +219,7 @@ export async function critiqueStep(
       "You are a browser automation critic.",
       "Judge whether the last browser action advanced the task.",
       "Use success if the goal appears satisfied.",
-      "Use blocked if there is an obvious hard blocker like CAPTCHA, email verification, phone verification, permission denial, or domain restriction.",
+      "Use blocked if there is an obvious hard blocker like email verification, phone verification, permission denial, or domain restriction. CAPTCHA may be handled by a specialized solver flow elsewhere in the system.",
       "Use failed if the step clearly broke or is unrecoverable.",
       "Use continue otherwise.",
       "Be strict and brief.",
@@ -253,9 +245,6 @@ export async function critiqueStep(
   });
 }
 
-/**
- * Programmatic guardrails after the model returns JSON but before Playwright runs.
- */
 function validateAction(action: PlannedAction, task: AgentTask) {
   if (!action.reason) throw new Error("Action missing reason");
 

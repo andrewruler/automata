@@ -16,7 +16,9 @@ import { ensureAllowedUrl } from "./guardrails.js";
 
 const ACTION_TIMEOUT_MS = 5000;
 
-async function getViewportSize(page: Page): Promise<{ width: number; height: number }> {
+async function getViewportSize(
+  page: Page
+): Promise<{ width: number; height: number }> {
   const viewport = page.viewportSize();
   if (viewport) return viewport;
   return await page.evaluate(() => ({
@@ -29,14 +31,20 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
-function normalizedPointToViewport(point: { x: number; y: number }, viewport: { width: number; height: number }) {
+function normalizedPointToViewport(
+  point: { x: number; y: number },
+  viewport: { width: number; height: number }
+) {
   return {
     x: clamp(Math.round(point.x * viewport.width), 0, viewport.width - 1),
     y: clamp(Math.round(point.y * viewport.height), 0, viewport.height - 1),
   };
 }
 
-function bboxCenterToViewport(bbox: { x1: number; y1: number; x2: number; y2: number }, viewport: { width: number; height: number }) {
+function bboxCenterToViewport(
+  bbox: { x1: number; y1: number; x2: number; y2: number },
+  viewport: { width: number; height: number }
+) {
   return normalizedPointToViewport(
     { x: (bbox.x1 + bbox.x2) / 2, y: (bbox.y1 + bbox.y2) / 2 },
     viewport
@@ -53,12 +61,20 @@ function jitterOffsets(radiusPx: number): Array<{ dx: number; dy: number }> {
   ];
 }
 
-async function clickElementFromPoint(page: Page, x: number, y: number): Promise<boolean> {
+async function clickElementFromPoint(
+  page: Page,
+  x: number,
+  y: number
+): Promise<boolean> {
   return await page.evaluate(
     ({ clickX, clickY }: { clickX: number; clickY: number }) => {
       const element = document.elementFromPoint(clickX, clickY);
       if (!element || !(element instanceof HTMLElement)) return false;
-      element.scrollIntoView({ block: "center", inline: "center", behavior: "auto" });
+      element.scrollIntoView({
+        block: "center",
+        inline: "center",
+        behavior: "auto",
+      });
       const rect = element.getBoundingClientRect();
       const centerX = rect.left + rect.width / 2;
       const centerY = rect.top + rect.height / 2;
@@ -110,7 +126,6 @@ async function clickByVision(page: Page, action: PlannedAction): Promise<string>
         return `click:vision (mouse ${i + 1} of ${maxRetries})`;
       }
 
-      // Fallback to DOM click via elementFromPoint if the mouse click did not change URL.
       const domClicked = await clickElementFromPoint(page, x, y);
       if (domClicked) {
         await page.waitForTimeout(300);
@@ -119,25 +134,31 @@ async function clickByVision(page: Page, action: PlannedAction): Promise<string>
         }
         return `click:vision (elementFromPoint ${i + 1} of ${maxRetries})`;
       }
-
-      // If we reach here, the click did not visibly navigate; continue to next candidate.
     } catch (err) {
       void err;
     }
   }
 
-  throw new Error(`Vision click failed after ${maxRetries} attempts (base point ${basePoint.x},${basePoint.y})`);
+  throw new Error(
+    `Vision click failed after ${maxRetries} attempts (base point ${basePoint.x},${basePoint.y})`
+  );
 }
 
 async function selectFirstDropdownOptionIfVisible(page: Page): Promise<boolean> {
   const chosen = await page.evaluate(() => {
-    const options = Array.from(document.querySelectorAll('li[role="option"], [role="option"]'))
-      .filter((el) => {
-        if (!(el instanceof HTMLElement)) return false;
-        const style = window.getComputedStyle(el);
-        const rect = el.getBoundingClientRect();
-        return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
-      });
+    const options = Array.from(
+      document.querySelectorAll('li[role="option"], [role="option"]')
+    ).filter((el) => {
+      if (!(el instanceof HTMLElement)) return false;
+      const style = window.getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return (
+        style.visibility !== "hidden" &&
+        style.display !== "none" &&
+        rect.width > 0 &&
+        rect.height > 0
+      );
+    });
     if (options.length === 0) return false;
     (options[0] as HTMLElement).click();
     return true;
@@ -149,35 +170,46 @@ async function selectFirstDropdownOptionIfVisible(page: Page): Promise<boolean> 
   return chosen;
 }
 
-async function tryGoogleSignupOptionSelect(page: Page, wantedText: string): Promise<boolean> {
+async function tryGoogleSignupOptionSelect(
+  page: Page,
+  wantedText: string
+): Promise<boolean> {
   return await page.evaluate((wantedRaw) => {
     if (!location.hostname.includes("accounts.google.com")) return false;
-    if (!location.pathname.includes("/lifecycle/steps/signup/birthdaygender")) return false;
+    if (!location.pathname.includes("/lifecycle/steps/signup/birthdaygender"))
+      return false;
     const wanted = wantedRaw.trim().toLowerCase();
     if (!wanted) return false;
 
     const openDropdown = (kind: "month" | "gender"): boolean => {
-      const overlays = Array.from(document.querySelectorAll(".VfPpkd-aPP78e")).filter((el) => {
-        if (!(el instanceof HTMLElement)) return false;
-        const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden";
-      }) as HTMLElement[];
+      const overlays = Array.from(document.querySelectorAll(".VfPpkd-aPP78e")).filter(
+        (el) => {
+          if (!(el instanceof HTMLElement)) return false;
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden";
+        }
+      ) as HTMLElement[];
       if (overlays.length === 0) return false;
 
-      // On this page, month is usually the first dropdown and gender the second.
       const idx = kind === "month" ? 0 : Math.min(1, overlays.length - 1);
       overlays[idx].click();
       return true;
     };
 
-    if (wanted.includes("january") || wanted.includes("february") || wanted.includes("march")) {
+    if (
+      wanted.includes("january") ||
+      wanted.includes("february") ||
+      wanted.includes("march")
+    ) {
       openDropdown("month");
     } else {
       openDropdown("gender");
     }
 
-    const options = Array.from(document.querySelectorAll('li[role="option"], [role="option"]'));
+    const options = Array.from(
+      document.querySelectorAll('li[role="option"], [role="option"]')
+    );
     const match = options.find((el) => {
       const t = (el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
       return t.includes(wanted);
@@ -188,16 +220,22 @@ async function tryGoogleSignupOptionSelect(page: Page, wantedText: string): Prom
   }, wantedText);
 }
 
-async function tryGoogleSignupOpenDropdown(page: Page, kind: "month" | "gender"): Promise<boolean> {
+async function tryGoogleSignupOpenDropdown(
+  page: Page,
+  kind: "month" | "gender"
+): Promise<boolean> {
   return await page.evaluate((k) => {
     if (!location.hostname.includes("accounts.google.com")) return false;
-    if (!location.pathname.includes("/lifecycle/steps/signup/birthdaygender")) return false;
-    const overlays = Array.from(document.querySelectorAll(".VfPpkd-aPP78e")).filter((el) => {
-      if (!(el instanceof HTMLElement)) return false;
-      const rect = el.getBoundingClientRect();
-      const style = window.getComputedStyle(el);
-      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden";
-    }) as HTMLElement[];
+    if (!location.pathname.includes("/lifecycle/steps/signup/birthdaygender"))
+      return false;
+    const overlays = Array.from(document.querySelectorAll(".VfPpkd-aPP78e")).filter(
+      (el) => {
+        if (!(el instanceof HTMLElement)) return false;
+        const rect = el.getBoundingClientRect();
+        const style = window.getComputedStyle(el);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden";
+      }
+    ) as HTMLElement[];
     if (overlays.length === 0) return false;
     const idx = k === "month" ? 0 : Math.min(1, overlays.length - 1);
     overlays[idx].click();
@@ -208,23 +246,27 @@ async function tryGoogleSignupOpenDropdown(page: Page, kind: "month" | "gender")
 async function clickWithFallbacks(page: Page, selector: string): Promise<string> {
   const selectorLower = selector.trim().toLowerCase();
 
-  // Prefer field-aware handling on Google signup before generic click paths.
-  if (selectorLower.includes("text=gender") || selectorLower.includes("please select your gender")) {
+  if (
+    selectorLower.includes("text=gender") ||
+    selectorLower.includes("please select your gender")
+  ) {
     const opened = await tryGoogleSignupOpenDropdown(page, "gender");
     if (opened) return "click:google-open-gender";
   }
   if (selectorLower.includes("text=month")) {
     const opened = await tryGoogleSignupOpenDropdown(page, "month");
     if (opened) return "click:google-open-month";
-  }  if (
+  }
+  if (
     selectorLower.includes('aria-label="month"') ||
     selectorLower.includes("aria-label='month'") ||
-    (selectorLower.includes("role=\"combobox\"") && selectorLower.includes("month")) ||
-    selectorLower.includes("input[aria-label=\"month\"]")
+    (selectorLower.includes('role="combobox"') && selectorLower.includes("month")) ||
+    selectorLower.includes('input[aria-label="month"]')
   ) {
     const opened = await tryGoogleSignupOpenDropdown(page, "month");
     if (opened) return "click:google-open-month";
-  }  if (selectorLower.startsWith("text=")) {
+  }
+  if (selectorLower.startsWith("text=")) {
     const wanted = selector.slice(5).trim().replace(/^["']|["']$/g, "");
     const googleOptionSelected = await tryGoogleSignupOptionSelect(page, wanted);
     if (googleOptionSelected) return "click:google-option-select";
@@ -235,19 +277,16 @@ async function clickWithFallbacks(page: Page, selector: string): Promise<string>
   try {
     await target.click({ timeout: ACTION_TIMEOUT_MS });
     return "click:normal";
-  } catch {
-    // continue to fallback chain
-  }
+  } catch {}
 
   try {
     await target.click({ timeout: ACTION_TIMEOUT_MS, force: true });
     return "click:force";
-  } catch {
-    // continue
-  }
+  } catch {}
 
   const jsClicked = await target.evaluate((el) => {
-    const isHtml = (n: Element | null): n is HTMLElement => !!n && n instanceof HTMLElement;
+    const isHtml = (n: Element | null): n is HTMLElement =>
+      !!n && n instanceof HTMLElement;
     const nearestActionable = (start: Element | null): HTMLElement | null => {
       let node: Element | null = start;
       while (node) {
@@ -272,24 +311,31 @@ async function clickWithFallbacks(page: Page, selector: string): Promise<string>
     const candidate = nearestActionable(fromPoint) ?? nearestActionable(el);
     if (!candidate) return false;
 
-    candidate.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
-    candidate.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true }));
+    candidate.dispatchEvent(
+      new MouseEvent("mousedown", { bubbles: true, cancelable: true })
+    );
+    candidate.dispatchEvent(
+      new MouseEvent("mouseup", { bubbles: true, cancelable: true })
+    );
     candidate.click();
     return true;
   });
 
   if (jsClicked) return "click:js-fallback";
 
-  // Dropdown-heavy UIs (e.g. Google) often require clicking the option container
-  // or the visible overlay rather than the label/text span.
   const optionContainerClicked = await page.evaluate((rawSelector) => {
     const selector = rawSelector.trim();
     const textPrefix = "text=";
     if (!selector.toLowerCase().startsWith(textPrefix)) return false;
-    const wanted = selector.slice(textPrefix.length).trim().replace(/^["']|["']$/g, "");
+    const wanted = selector
+      .slice(textPrefix.length)
+      .trim()
+      .replace(/^["']|["']$/g, "");
     if (!wanted) return false;
 
-    const options = Array.from(document.querySelectorAll('li[role="option"], [role="option"]'));
+    const options = Array.from(
+      document.querySelectorAll('li[role="option"], [role="option"]')
+    );
     const match = options.find((el) => {
       const t = (el.textContent || "").replace(/\s+/g, " ").trim().toLowerCase();
       return t.includes(wanted.toLowerCase());
@@ -306,20 +352,22 @@ async function clickWithFallbacks(page: Page, selector: string): Promise<string>
       selector.includes("gender") ||
       selector.includes("month") ||
       selector.includes('input[type="text"]') ||
-      selector.includes("role=\"option\"");
+      selector.includes('role="option"');
     if (!isLikelyDropdownTarget) return false;
 
-    const overlays = Array.from(document.querySelectorAll(".VfPpkd-aPP78e")).filter((el) => {
-      if (!(el instanceof HTMLElement)) return false;
-      const style = window.getComputedStyle(el);
-      const rect = el.getBoundingClientRect();
-      return (
-        style.visibility !== "hidden" &&
-        style.display !== "none" &&
-        rect.width > 0 &&
-        rect.height > 0
-      );
-    }) as HTMLElement[];
+    const overlays = Array.from(document.querySelectorAll(".VfPpkd-aPP78e")).filter(
+      (el) => {
+        if (!(el instanceof HTMLElement)) return false;
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return (
+          style.visibility !== "hidden" &&
+          style.display !== "none" &&
+          rect.width > 0 &&
+          rect.height > 0
+        );
+      }
+    ) as HTMLElement[];
 
     if (overlays.length === 0) return false;
     overlays[overlays.length - 1].click();
@@ -333,28 +381,37 @@ async function clickWithFallbacks(page: Page, selector: string): Promise<string>
 function isOverGenericFillSelector(selector: string): boolean {
   const s = selector.replace(/\s+/g, "").toLowerCase();
   return (
-    s === "input[type=\"text\"]" ||
+    s === 'input[type="text"]' ||
     s === "input[type='text']" ||
     s === "input[type=text]" ||
-    s === "input[type=\"text\"]:not([name])" ||
+    s === 'input[type="text"]:not([name])' ||
     s === "input[type='text']:not([name])" ||
     s === "input[type=text]:not([name])"
   );
 }
 
-async function refineGenericFillSelector(page: Page, selector: string): Promise<string | null> {
+async function refineGenericFillSelector(
+  page: Page,
+  selector: string
+): Promise<string | null> {
   return await page.evaluate((rawSelector) => {
     const sel = rawSelector.trim();
     const element = document.querySelector(sel);
     if (!(element instanceof HTMLElement)) return null;
     const tag = element.tagName.toLowerCase();
-    if (tag !== "input" && tag !== "textarea" && !element.isContentEditable) return null;
+    if (tag !== "input" && tag !== "textarea" && !element.isContentEditable)
+      return null;
 
     const isVisible = (el: Element | null): el is HTMLElement => {
       if (!(el instanceof HTMLElement)) return false;
       const rect = el.getBoundingClientRect();
       const style = window.getComputedStyle(el);
-      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+      return (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.visibility !== "hidden" &&
+        style.display !== "none"
+      );
     };
 
     const attrs: Array<[string, string | null]> = [
@@ -375,7 +432,9 @@ async function refineGenericFillSelector(page: Page, selector: string): Promise<
     }
 
     if (element.id) {
-      const labels = Array.from(document.querySelectorAll(`label[for=${JSON.stringify(element.id)}]`));
+      const labels = Array.from(
+        document.querySelectorAll(`label[for=${JSON.stringify(element.id)}]`)
+      );
       for (const label of labels) {
         if (!(label instanceof HTMLElement)) continue;
         const text = (label.textContent || "").trim();
@@ -390,7 +449,9 @@ async function refineGenericFillSelector(page: Page, selector: string): Promise<
     if (visibleMatches.length === 1) return sel;
 
     for (const candidate of candidates) {
-      const matches = Array.from(document.querySelectorAll(candidate)).filter(isVisible);
+      const matches = Array.from(document.querySelectorAll(candidate)).filter(
+        isVisible
+      );
       if (matches.length === 1) return candidate;
     }
 
@@ -398,23 +459,23 @@ async function refineGenericFillSelector(page: Page, selector: string): Promise<
   }, selector);
 }
 
-async function fillWithFallbacks(page: Page, selector: string, value: string): Promise<string> {
+async function fillWithFallbacks(
+  page: Page,
+  selector: string,
+  value: string
+): Promise<string> {
   const target = page.locator(selector).first();
 
   try {
     await target.fill(value, { timeout: ACTION_TIMEOUT_MS });
     return "fill:normal";
-  } catch {
-    // continue
-  }
+  } catch {}
 
   try {
     await target.click({ timeout: ACTION_TIMEOUT_MS, force: true });
     await target.fill(value, { timeout: ACTION_TIMEOUT_MS, force: true });
     return "fill:force";
-  } catch {
-    // continue
-  }
+  } catch {}
 
   const jsFilled = await target.evaluate(
     (el, nextValue) => {
@@ -445,7 +506,10 @@ async function fillWithFallbacks(page: Page, selector: string, value: string): P
 
       candidate.click();
 
-      if (candidate instanceof HTMLInputElement || candidate instanceof HTMLTextAreaElement) {
+      if (
+        candidate instanceof HTMLInputElement ||
+        candidate instanceof HTMLTextAreaElement
+      ) {
         candidate.focus();
         candidate.value = nextValue;
         candidate.dispatchEvent(new Event("input", { bubbles: true }));
@@ -473,20 +537,6 @@ async function fillWithFallbacks(page: Page, selector: string, value: string): P
 
 /**
  * Executes one `PlannedAction` on the given Playwright `Page`.
- *
- * Order of operations (typical case):
- *   1. Switch on `action.actionType` and run the matching Playwright API.
- *   2. After navigation-like actions, `settle` waits briefly for SPA updates.
- *   3. Re-run `ensureAllowedUrl` on the **current** URL (catch unexpected redirects off-domain).
- *   4. Save a full-page PNG under the run directory and return its path.
- *
- * Special case: `done` returns immediately **without** a screenshot (nothing to “do” in the page).
- *
- * @param page — Tab to automate.
- * @param task — Supplies `allowedDomains` and `credentials` for fills.
- * @param action — One planner output (already validated by `validateAction`).
- * @param logger — For console + disk log lines and screenshot path generation.
- * @returns Human-readable result string for the critic, optional screenshot path.
  */
 export async function executeAction(
   page: Page,
@@ -498,19 +548,13 @@ export async function executeAction(
     case "goto": {
       ensureAllowedUrl(action.url!, task.allowedDomains);
       logger.log(`goto: ${action.url} (${action.reason})`);
-      await page.goto(action.url!, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await page.goto(action.url!, {
+        waitUntil: "domcontentloaded",
+        timeout: 30000,
+      });
       break;
     }
-    // Add to your executeAction method
-async executeAction(page: Page, action: any): Promise<void> {
-  // Check if action indicates captcha
-  if (action.status === 'captcha_detected') {
-    throw new Error('CaptchaDetected');
-  }
-  
-  // Your existing execution logic
-  // ...
-}
+
     case "click": {
       if (action.executionMode === "vision") {
         logger.log(`click: vision (${action.reason})`);
@@ -562,22 +606,40 @@ async executeAction(page: Page, action: any): Promise<void> {
     case "press": {
       if (action.selector) {
         logger.log(`press: ${action.key} on ${action.selector} (${action.reason})`);
-        const wasDropdown = /gender|month|day|year|month|combobox/i.test(action.selector);
-        if (wasDropdown && (action.key === "ArrowDown" || action.key === "ArrowUp" || action.key === "Enter")) {
+        const wasDropdown = /gender|month|day|year|month|combobox/i.test(
+          action.selector
+        );
+        if (
+          wasDropdown &&
+          (action.key === "ArrowDown" ||
+            action.key === "ArrowUp" ||
+            action.key === "Enter")
+        ) {
           const selected = await selectFirstDropdownOptionIfVisible(page);
           if (selected) {
-            logger.log(`press: selected first visible dropdown option for ${action.selector}`);
+            logger.log(
+              `press: selected first visible dropdown option for ${action.selector}`
+            );
             await settle(page);
             break;
           }
         }
-        await page.locator(action.selector).first().press(action.key!, { timeout: ACTION_TIMEOUT_MS });
+        await page
+          .locator(action.selector)
+          .first()
+          .press(action.key!, { timeout: ACTION_TIMEOUT_MS });
       } else {
         logger.log(`press: ${action.key} on page keyboard (${action.reason})`);
-        if (action.key === "ArrowDown" || action.key === "ArrowUp" || action.key === "Enter") {
+        if (
+          action.key === "ArrowDown" ||
+          action.key === "ArrowUp" ||
+          action.key === "Enter"
+        ) {
           const selected = await selectFirstDropdownOptionIfVisible(page);
           if (selected) {
-            logger.log(`press: selected first visible dropdown option via global action ${action.key}`);
+            logger.log(
+              `press: selected first visible dropdown option via global action ${action.key}`
+            );
             await settle(page);
             break;
           }
@@ -614,9 +676,6 @@ async executeAction(page: Page, action: any): Promise<void> {
 
 /**
  * Best-effort wait for the document to settle after a click/navigation.
- * Many SPAs update the DOM asynchronously; a fixed short delay reduces flaky “observe too early”.
- *
- * @param page — Current tab.
  */
 async function settle(page: Page) {
   try {

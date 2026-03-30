@@ -1,154 +1,312 @@
-import { Page } from 'playwright';
-import { llm } from './llm.js';
+/**
+ * =============================================================================
+ * AGENT ORCHESTRATION — the full "sense → think → act → review" loop
+ * =============================================================================
+ *
+ * Called from `index.ts` via `runLLMAgentTask(task)`.
+ *
+ * One **iteration** (one value of `step`) does:
+ *   (1) Observe page  →  (2) Planner LLM picks next action  →  (3) Execute with Playwright
+ *   →  (4) Observe again  →  (5) Critic LLM judges outcome  →  (6) Record history
+ *
+ * The planner sees past steps through `history` and its own OpenAI thread (`JsonThread`).
+ * The critic has a separate thread so its "conversation" doesn't collide with planning.
+ *
+ * Stops when: planner says `done`, critic says `success` / `blocked` / `failed`,
+ * or limits (`maxSteps`, `deadlineSeconds`) hit.
+ */
+import path from "node:path";
+import { createBrowserSession } from "./chrome.js";
+import { Logger } from "./logger.js";
+import { JsonThread } from "./llm.js";
+import { critiqueStep, planNextAction } from "./llmAgent.js";
+import { executeAction } from "./executor.js";
+import { AgentTask, ExecutionResult, StepRecord } from "./types.js";
+import { ensureAllowedUrl } from "./guardrails.js";
+import { buildObservationBundle } from "./observationBundle.js";
+import { CaptchaHandler } from "./captchaHandler.js";
 
-export interface CaptchaSolution {
-  type: 'click' | 'type' | 'select';
-  coordinates?: { x: number; y: number };
-  text?: string;
-  selector?: string;
-  description: string;
+function classifyDoneMessage(message: string): boolean {
+  const text = message.toLowerCase();
+  const blockedSignals = [
+    "blocked",
+    "cannot",
+    "can't",
+    "unable",
+    "missing",
+    "requires",
+    "requirement",
+    "need ",
+    "not provided",
+    "captcha",
+    "verification",
+    "mfa",
+    "2fa",
+    "phone",
+    "email verify",
+  ];
+  return !blockedSignals.some((signal) => text.includes(signal));
 }
 
-export class CaptchaHandler {
-  private maxAttempts = 3;
-  
-  async handleCaptcha(page: Page, screenshotBuffer: Buffer): Promise<boolean> {
-    let attempts = 0;
-    
-    while (attempts < this.maxAttempts) {
-      try {
-        // Get captcha solution from GPT
-        const solution = await this.getCaptchaSolution(screenshotBuffer);
-        
-        // Execute the solution
-        const success = await this.executeSolution(page, solution);
-        
-        if (success) {
-          // Click continue button
-          await this.clickContinue(page);
-          return true;
-        }
-        
-        attempts++;
-      } catch (error) {
-        console.error(`Captcha attempt ${attempts + 1} failed:`, error);
-        attempts++;
+function needsFallbackVision(history: StepRecord[]): boolean {
+  if (history.length === 0) return false;
+  const last = history[history.length - 1];
+  return last.result.startsWith("Execution error:");
+}
+
+function actionSignature(action: {
+  actionType: string;
+  selector?: string;
+  url?: string;
+}): string {
+  return `${action.actionType}|${action.selector ?? ""}|${action.url ?? ""}`;
+}
+
+function isRepeatedFailingAction(history: StepRecord[], signature: string): boolean {
+  const recent = history.slice(-6);
+  const matchingFailures = recent.filter(
+    (h) =>
+      actionSignature(h.action) === signature &&
+      h.result.startsWith("Execution error:")
+  );
+  return matchingFailures.length >= 2;
+}
+
+function isPressNoProgressLoop(history: StepRecord[]): boolean {
+  const recent = history.slice(-4);
+  if (recent.length < 3) return false;
+  const pressOnly = recent.every((h) => h.action.actionType === "press");
+  if (!pressOnly) return false;
+  const lastUrl = recent[recent.length - 1].urlAfter;
+  const sameUrl = recent.every((h) => h.urlAfter === lastUrl);
+  return sameUrl;
+}
+
+async function detectCaptcha(page: any): Promise<boolean> {
+  const captchaSelectors = [
+    'iframe[src*="recaptcha"]',
+    'iframe[src*="captcha"]',
+    ".captcha",
+    '[id*="captcha"]',
+    'img[alt*="captcha" i]',
+    '[class*="captcha"]',
+  ];
+
+  for (const selector of captchaSelectors) {
+    const element = await page.$(selector);
+    if (element) return true;
+  }
+
+  return false;
+}
+
+async function captureCaptchaArea(page: any): Promise<Buffer | null> {
+  try {
+    const captchaElement = await page.$(
+      'iframe[src*="recaptcha"], .captcha, [id*="captcha"]'
+    );
+
+    if (captchaElement) {
+      const bbox = await captchaElement.boundingBox();
+      if (bbox) {
+        return await page.screenshot({
+          clip: {
+            x: Math.max(0, bbox.x - 20),
+            y: Math.max(0, bbox.y - 20),
+            width: bbox.width + 40,
+            height: bbox.height + 40,
+          },
+        });
       }
     }
-    
-    // If all attempts fail, wait for manual assistance
-    await this.waitForManualAssistance(page);
-    return false;
+
+    return await page.screenshot();
+  } catch (error) {
+    console.error("Failed to capture captcha area:", error);
+    return null;
   }
-  
-  private async getCaptchaSolution(screenshotBuffer: Buffer): Promise<CaptchaSolution> {
-    const prompt = `
-      Analyze this captcha image and provide a solution in JSON format:
-      
-      {
-        "type": "click" | "type" | "select",
-        "coordinates": { "x": number, "y": number } | null,
-        "text": string | null,
-        "selector": string | null,
-        "description": "Brief description of what to do"
-      }
-      
-      For image captchas: use "click" with coordinates
-      For text captchas: use "type" with the text
-      For selection captchas: use "select" with selector
-    `;
-    
-    const response = await llm.getResponse([
-      { role: 'system', content: 'You are a captcha solver. Respond only with valid JSON.' },
-      { role: 'user', content: prompt }
-    ], screenshotBuffer);
-    
-    return JSON.parse(response);
-  }
-  
-  private async executeSolution(page: Page, solution: CaptchaSolution): Promise<boolean> {
+}
+
+/**
+ * Runs a single browser automation "episode" for the given task.
+ *
+ * Steps inside this function:
+ * 1. Create logger + planner/critic LLM threads.
+ * 2. Open browser (`createBrowserSession`) — Chrome per `CHROME_*` env.
+ * 3. Guard + navigate to `task.startUrl`.
+ * 4. Loop: observe → plan → [maybe execute] → observe → critique → append history.
+ * 5. `finally`: always `dispose()` the browser session (CDP disconnect vs full close).
+ *
+ * @param task — Goal, URLs, domain allowlist, timeouts, optional credential map.
+ * @returns Summary for the user: success flag, step count, paths to screenshots, errors, optional auth state file.
+ */
+export async function runLLMAgentTask(task: AgentTask): Promise<ExecutionResult> {
+  const logger = new Logger(task.name);
+  const planner = new JsonThread();
+  const critic = new JsonThread();
+  const captchaHandler = new CaptchaHandler();
+
+  const deadline = Date.now() + task.deadlineSeconds * 1000;
+  const session = await createBrowserSession();
+  const { context, page, mode, dispose } = session;
+  logger.log(`browser session: ${mode} (HEADLESS=${process.env.HEADLESS === "true"})`);
+
+  const history: StepRecord[] = [];
+
+  try {
     try {
-      switch (solution.type) {
-        case 'click':
-          if (solution.coordinates) {
-            await page.mouse.click(solution.coordinates.x, solution.coordinates.y);
-          }
-          break;
-          
-        case 'type':
-          if (solution.text) {
-            await page.keyboard.type(solution.text);
-          }
-          break;
-          
-        case 'select':
-          if (solution.selector) {
-            await page.click(solution.selector);
-          }
-          break;
-      }
-      
-      // Wait a moment for the action to register
-      await page.waitForTimeout(1000);
-      return true;
-    } catch (error) {
-      console.error('Failed to execute captcha solution:', error);
-      return false;
+      ensureAllowedUrl(task.startUrl, task.allowedDomains);
+      await page.goto(task.startUrl, {
+        waitUntil: "domcontentloaded",
+        timeout: 30000,
+      });
+      logger.log(`startup navigation: ${task.startUrl}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error(`startup navigation failed: ${msg}`);
+      logger.log(
+        "continuing from current page so planner can recover (for example by issuing a goto action)."
+      );
     }
-  }
-  
-  private async clickContinue(page: Page): Promise<void> {
-    // Common continue button selectors
-    const continueSelectors = [
-      'button[type="submit"]',
-      'button:has-text("Continue")',
-      'button:has-text("Submit")',
-      'input[type="submit"]',
-      '.continue-btn',
-      '#continue'
-    ];
-    
-    for (const selector of continueSelectors) {
-      try {
-        const element = await page.$(selector);
-        if (element) {
-          await element.click();
-          await page.waitForTimeout(1000);
-          break;
+
+    for (let step = 1; step <= task.maxSteps && Date.now() < deadline; step++) {
+      const forceVision =
+        needsFallbackVision(history) &&
+        (process.env.VISION_MODE ?? "off").trim().toLowerCase() === "fallback";
+      const before = await buildObservationBundle(page, logger, step, "before", forceVision);
+
+      const action = await planNextAction(planner, task, before, history);
+      const signature = actionSignature(action);
+
+      if (action.actionType === "done") {
+        const doneText = action.doneMessage ?? action.reason;
+        const doneIsSuccess = classifyDoneMessage(doneText);
+        if (!doneIsSuccess) {
+          logger.log(`done classified as non-success: ${doneText}`);
         }
-      } catch (error) {
-        // Continue to next selector
+        const authStatePath = path.join(logger.dir, "storage-state.json");
+        await context.storageState({ path: authStatePath });
+        return {
+          success: doneIsSuccess,
+          stepsCompleted: step - 1,
+          message: doneText,
+          lastUrl: page.url(),
+          screenshots: logger.screenshots,
+          errors: logger.errors,
+          authStatePath,
+        };
+      }
+
+      let execMessage = "";
+      let screenshot: string | undefined;
+
+      try {
+        if (action.actionType === "press" && isPressNoProgressLoop(history)) {
+          execMessage =
+            "Execution error: skipping repeated no-progress press loop; choose click/fill on a specific control.";
+          logger.error(execMessage);
+        } else if (isRepeatedFailingAction(history, signature)) {
+          execMessage =
+            "Execution error: skipped repeated failing action; choose a different selector or strategy.";
+          logger.error(execMessage);
+        } else {
+          const hasCaptcha = await detectCaptcha(page);
+
+          if (hasCaptcha) {
+            logger.log("Captcha detected! Handling...");
+            const captchaScreenshot = await captureCaptchaArea(page);
+
+            if (captchaScreenshot) {
+              const captchaSolved = await captchaHandler.handleCaptcha(
+                page,
+                captchaScreenshot
+              );
+
+              if (!captchaSolved) {
+                execMessage =
+                  "Captcha solving failed after maximum attempts. Waiting for manual assistance.";
+                logger.error(execMessage);
+              } else {
+                logger.log("Captcha solved successfully");
+                await page.waitForTimeout(2000);
+              }
+            }
+          }
+
+          const exec = await executeAction(page, task, action, logger);
+          execMessage = exec.message;
+          screenshot = exec.screenshot;
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.error(msg);
+        execMessage = `Execution error: ${msg}`;
+      }
+
+      const afterForceVision =
+        (process.env.VISION_MODE ?? "off").trim().toLowerCase() === "every" ||
+        ((process.env.VISION_MODE ?? "off").trim().toLowerCase() === "fallback" &&
+          execMessage.startsWith("Execution error:"));
+      const after = await buildObservationBundle(page, logger, step, "after", afterForceVision);
+
+      const verdict = await critiqueStep(
+        critic,
+        task,
+        before,
+        action,
+        execMessage,
+        after,
+        history
+      );
+
+      history.push({
+        step,
+        observation: before.html,
+        action,
+        result: execMessage,
+        screenshot,
+        urlAfter: after.html.url,
+        criticStatus: verdict.status,
+        criticSummary: verdict.summary,
+      });
+
+      logger.log(`step ${step}: ${action.actionType} -> ${verdict.status} | ${verdict.summary}`);
+
+      if (verdict.status === "success") {
+        const authStatePath = path.join(logger.dir, "storage-state.json");
+        await context.storageState({ path: authStatePath });
+        return {
+          success: true,
+          stepsCompleted: step,
+          message: verdict.summary,
+          lastUrl: page.url(),
+          screenshots: logger.screenshots,
+          errors: logger.errors,
+          authStatePath,
+        };
+      }
+
+      if (verdict.status === "blocked" || verdict.status === "failed") {
+        return {
+          success: false,
+          stepsCompleted: step,
+          message: verdict.summary,
+          lastUrl: page.url(),
+          screenshots: logger.screenshots,
+          errors: logger.errors,
+        };
       }
     }
-  }
-  
-  private async waitForManualAssistance(page: Page): Promise<void> {
-    console.log('Captcha solving failed after maximum attempts. Waiting for manual assistance...');
-    
-    // Keep the browser open for manual intervention
-    await page.waitForTimeout(60000); // Wait 1 minute
-    
-    // Check if captcha is still present
-    const captchaStillPresent = await this.detectCaptcha(page);
-    if (captchaStillPresent) {
-      console.log('Captcha still present after manual intervention timeout.');
-    }
-  }
-  
-  private async detectCaptcha(page: Page): Promise<boolean> {
-    const captchaIndicators = [
-      'iframe[src*="recaptcha"]',
-      'iframe[src*="captcha"]',
-      '.captcha',
-      '[id*="captcha"]',
-      'img[alt*="captcha" i]'
-    ];
-    
-    for (const selector of captchaIndicators) {
-      const element = await page.$(selector);
-      if (element) return true;
-    }
-    
-    return false;
+
+    return {
+      success: false,
+      stepsCompleted: history.length,
+      message: "Stopped: deadline or maxSteps reached",
+      lastUrl: page.url(),
+      screenshots: logger.screenshots,
+      errors: logger.errors,
+    };
+  } finally {
+    await dispose();
   }
 }
