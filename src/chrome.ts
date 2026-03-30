@@ -219,8 +219,9 @@ export async function createBrowserSession(): Promise<BrowserSession> {
           );
           return createLaunchSession(channel, viewport);
         }
+        const raw = errorMessage(err);
         throw new Error(
-          "Chrome profile is already in use. Close all Chrome windows for this profile and run again. If you intentionally want temporary-profile fallback, set CHROME_ALLOW_TEMP_FALLBACK=true."
+          `Chrome profile is already in use. Close all Chrome windows for this profile and run again. If you intentionally want temporary-profile fallback, set CHROME_ALLOW_TEMP_FALLBACK=true. Raw launch error: ${raw}`
         );
       }
       throw new Error(

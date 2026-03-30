@@ -1,6 +1,6 @@
 /**
  * =============================================================================
- * AGENT ORCHESTRATION — the full “sense → think → act → review” loop
+ * AGENT ORCHESTRATION — the full "sense → think → act → review" loop
  * =============================================================================
  *
  * Called from `index.ts` via `runLLMAgentTask(task)`.
@@ -10,7 +10,7 @@
  *   →  (4) Observe again  →  (5) Critic LLM judges outcome  →  (6) Record history
  *
  * The planner sees past steps through `history` and its own OpenAI thread (`JsonThread`).
- * The critic has a separate thread so its “conversation” doesn’t collide with planning.
+ * The critic has a separate thread so its "conversation" doesn't collide with planning.
  *
  * Stops when: planner says `done`, critic says `success` / `blocked` / `failed`,
  * or limits (`maxSteps`, `deadlineSeconds`) hit.
@@ -24,6 +24,7 @@ import { executeAction } from "./executor.js";
 import { AgentTask, ExecutionResult, StepRecord } from "./types.js";
 import { ensureAllowedUrl } from "./guardrails.js";
 import { buildObservationBundle } from "./observationBundle.js";
+import { CaptchaHandler } from './captchaHandler.js';
 
 function classifyDoneMessage(message: string): boolean {
   const text = message.toLowerCase();
@@ -54,7 +55,7 @@ function needsFallbackVision(history: StepRecord[]): boolean {
 }
 
 function actionSignature(action: { actionType: string; selector?: string; url?: string }): string {
-  return `${action.actionType}|${action.selector ?? ""}|${action.url ?? ""}`;
+  return `${action.actionType}|${action.selector ?? ""}|\${action.url ?? ""}`;
 }
 
 function isRepeatedFailingAction(history: StepRecord[], signature: string): boolean {
@@ -75,8 +76,55 @@ function isPressNoProgressLoop(history: StepRecord[]): boolean {
   return sameUrl;
 }
 
+async function detectCaptcha(page: any): Promise<boolean> {
+  const captchaSelectors = [
+    'iframe[src*="recaptcha"]',
+    'iframe[src*="captcha"]',
+    '.captcha',
+    '[id*="captcha"]',
+    'img[alt*="captcha" i]',
+    '[class*="captcha"]'
+  ];
+  
+  for (const selector of captchaSelectors) {
+    const element = await page.$(selector);
+    if (element) return true;
+  }
+  
+  return false;
+}
+
+async function captureCaptchaArea(page: any): Promise<Buffer | null> {
+  try {
+    // Try to find captcha element
+    const captchaElement = await page.$('iframe[src*="recaptcha"], .captcha, [id*="captcha"]');
+    
+    if (captchaElement) {
+      // Get bounding box
+      const bbox = await captchaElement.boundingBox();
+      if (bbox) {
+        // Crop screenshot to captcha area with some padding
+        return await page.screenshot({
+          clip: {
+            x: Math.max(0, bbox.x - 20),
+            y: Math.max(0, bbox.y - 20),
+            width: bbox.width + 40,
+            height: bbox.height + 40
+          }
+        });
+      }
+    }
+    
+    // Fallback to full page screenshot
+    return await page.screenshot();
+  } catch (error) {
+    console.error('Failed to capture captcha area:', error);
+    return null;
+  }
+}
+
 /**
- * Runs a single browser automation “episode” for the given task.
+ * Runs a single browser automation "episode" for the given task.
  *
  * Steps inside this function:
  * 1. Create logger + planner/critic LLM threads.
@@ -93,6 +141,7 @@ export async function runLLMAgentTask(task: AgentTask): Promise<ExecutionResult>
   const logger = new Logger(task.name);
   const planner = new JsonThread();
   const critic = new JsonThread();
+  const captchaHandler = new CaptchaHandler();
 
   const deadline = Date.now() + task.deadlineSeconds * 1000;
   const session = await createBrowserSession();
@@ -104,11 +153,20 @@ export async function runLLMAgentTask(task: AgentTask): Promise<ExecutionResult>
 
   try {
     // --- Phase: land on the starting URL (before the main loop) ---
-    ensureAllowedUrl(task.startUrl, task.allowedDomains);
-    await page.goto(task.startUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+    try {
+      ensureAllowedUrl(task.startUrl, task.allowedDomains);
+      await page.goto(task.startUrl, { waitUntil: "domcontentloaded", timeout: 30000 });
+      logger.log(`startup navigation: ${task.startUrl}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error(`startup navigation failed: ${msg}`);
+      logger.log(
+        "continuing from current page so planner can recover (for example by issuing a goto action)."
+      );
+    }
 
     // =================================================================
-    // MAIN LOOP — each pass is one “agent step” (may include LLM + browser)
+    // MAIN LOOP — each pass is one "agent step" (may include LLM + browser)
     // =================================================================
     for (let step = 1; step <= task.maxSteps && Date.now() < deadline; step++) {
       // --- (1) Perceive: structured text snapshot of the current DOM (with optional vision fallback) ---
@@ -124,7 +182,7 @@ export async function runLLMAgentTask(task: AgentTask): Promise<ExecutionResult>
         const doneText = action.doneMessage ?? action.reason;
         const doneIsSuccess = classifyDoneMessage(doneText);
         if (!doneIsSuccess) {
-          logger.log(`done classified as non-success: ${doneText}`);
+          logger.log(`done classified as non-success: \${doneText}`);
         }
         const authStatePath = path.join(logger.dir, "storage-state.json");
         await context.storageState({ path: authStatePath });
@@ -154,6 +212,28 @@ export async function runLLMAgentTask(task: AgentTask): Promise<ExecutionResult>
             "Execution error: skipped repeated failing action; choose a different selector or strategy.";
           logger.error(execMessage);
         } else {
+          // Check for captcha before executing action
+          const hasCaptcha = await detectCaptcha(page);
+          
+          if (hasCaptcha) {
+            logger.log('Captcha detected! Handling...');
+            const captchaScreenshot = await captureCaptchaArea(page);
+            
+            if (captchaScreenshot) {
+              const captchaSolved = await captchaHandler.handleCaptcha(page, captchaScreenshot);
+              
+              if (!captchaSolved) {
+                execMessage = "Captcha solving failed after maximum attempts. Waiting for manual assistance.";
+                logger.error(execMessage);
+                // Continue with the action anyway - manual intervention might solve it
+              } else {
+                logger.log('Captcha solved successfully');
+                // Wait a moment after captcha solve
+                await page.waitForTimeout(2000);
+              }
+            }
+          }
+          
           const exec = await executeAction(page, task, action, logger);
           execMessage = exec.message;
           screenshot = exec.screenshot;

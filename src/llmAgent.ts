@@ -3,15 +3,16 @@
  * PLANNER + CRITIC — the two LLM roles that drive the agent loop
  * =============================================================================
  *
- * **`planNextAction`** (planner): “Given what I see on the page and recent history,
- * what is the **single** next browser action?” Returns `PlannedAction` JSON.
+ * `planNextAction` (planner): Given the current observation and recent history,
+ * choose the single next browser action.
  *
- * **`critiqueStep`** (critic): “Given before/after snapshots and what we tried,
- * should we **continue**, declare **success**, or stop (**blocked** / **failed**)?”
+ * `critiqueStep` (critic): Given before/after observations plus the execution
+ * result, decide whether to continue, declare success, or stop as blocked/failed.
  *
- * Both use **Structured Outputs** (JSON Schema). Schemas are `as const` in TS but cast to
- * `Record<string, unknown>` when passed to the OpenAI client (SDK typing requirement).
+ * Both use Structured Outputs (JSON Schema). Schemas are declared `as const` in
+ * TypeScript but cast to `Record<string, unknown>` for the OpenAI client.
  */
+
 import {
   AgentTask,
   CriticVerdict,
@@ -21,7 +22,7 @@ import {
 } from "./types.js";
 import { JsonThread } from "./llm.js";
 
-/** JSON Schema for the planner’s reply — must stay in sync with `PlannedAction` in `types.ts`. */
+/** JSON Schema for the planner reply. Keep in sync with `PlannedAction` in `types.ts`. */
 const actionSchema = {
   type: "object",
   properties: {
@@ -76,7 +77,7 @@ const actionSchema = {
   additionalProperties: false,
 } as const;
 
-/** JSON Schema for the critic’s reply — must stay in sync with `CriticVerdict`. */
+/** JSON Schema for the critic reply. Keep in sync with `CriticVerdict`. */
 const criticSchema = {
   type: "object",
   properties: {
@@ -93,20 +94,35 @@ const criticSchema = {
 } as const;
 
 /**
+ * Detects hard blockers that should be treated as blocked rather than retried.
+ * This does not attempt to solve or bypass them.
+ */
+function detectHardBlockers(observation: ObservationBundle): string | null {
+  const combined = [
+    observation.html,
+    typeof observation.vision === "string" ? observation.vision : "",
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .toLowerCase();
+
+  const blockerPatterns: Array<{ pattern: RegExp; label: string }> = [
+    { pattern: /captcha|recaptcha|hcaptcha|cf-turnstile|turnstile/, label: "CAPTCHA detected" },
+    { pattern: /verify you are human|prove you are human|human verification/, label: "Human verification detected" },
+    { pattern: /phone verification|verify your phone|enter verification code/, label: "Phone verification required" },
+    { pattern: /email verification|check your email to verify/, label: "Email verification required" },
+    { pattern: /permission denied|access denied|forbidden|not authorized/, label: "Access denied" },
+  ];
+
+  for (const { pattern, label } of blockerPatterns) {
+    if (pattern.test(combined)) return label;
+  }
+
+  return null;
+}
+
+/**
  * Asks the planner model for the next single step.
- *
- * Input payload includes:
- * - Task metadata (goal, allowed domains, credential **key names only** — never values),
- * - Current `observation` from `observePage`,
- * - Last few `history` entries so it can recover from errors.
- *
- * After the API returns, runs **`validateAction`** so invalid combinations (e.g. `click` without
- * `selector`) throw **before** Playwright runs.
- *
- * @param thread — Planner’s `JsonThread` (separate from critic).
- * @param task — Original task definition (domains, credentials map for key lookup, etc.).
- * @param observation — Current `PageObservation` (“before” snapshot in the loop).
- * @param history — All completed steps so far in this run.
  */
 export async function planNextAction(
   thread: JsonThread,
@@ -114,6 +130,25 @@ export async function planNextAction(
   observation: ObservationBundle,
   history: StepRecord[]
 ): Promise<PlannedAction> {
+  const hardBlocker = detectHardBlockers(observation);
+
+  if (hardBlocker) {
+    return {
+      actionType: "wait",
+      reason: `${hardBlocker}. Do not attempt to bypass it; let the critic classify the run as blocked.`,
+      url: null,
+      selector: null,
+      executionMode: null,
+      bbox: null,
+      clickPoint: null,
+      credentialKey: null,
+      text: null,
+      key: null,
+      ms: 1000,
+      doneMessage: null,
+    };
+  }
+
   const plan = await thread.ask<PlannedAction>({
     schemaName: "browser_next_action",
     schema: actionSchema as unknown as Record<string, unknown>,
@@ -127,12 +162,13 @@ export async function planNextAction(
       'Examples: button:has-text("Sign up"), input[name="email"], [data-testid="submit"].',
       'For fill actions, avoid generic selectors like input[type="text"] or input[type="text"]:not([name]); choose specific field selectors using name, aria-label, placeholder, label context, role, or data-* attributes.',
       'Prefer DOM selector (`executionMode: "dom"`) when page structure is clear. Use vision mode (`executionMode: "vision"`) only for hard-to-select elements where a screenshot and normalized bbox/clickPoint are more reliable.',
-      'When performing dropdown or combobox interaction, prefer explicit `click` actions on option items (e.g., `click text=Female`) over low-level `press` action keys when possible.',
+      'When performing dropdown or combobox interaction, prefer explicit `click` actions on option items (for example `click text=Female`) over low-level `press` keys when possible.',
       'Avoid using undesired global focus commands such as ArrowUp/ArrowDown/Enter unless the target element is clearly a keyboard-navigable combobox and no stable options are available.',
       'When using vision mode, include normalized coordinates in `bbox` or `clickPoint` (values 0–1 relative to viewport width/height).',
       "Do not invent elements that are not plausibly present in the observation.",
+      "Treat CAPTCHA, human verification, email verification, and phone verification as hard blockers rather than challenges to solve.",
       "Use actionType='done' only when the task is truly complete.",
-      "If the task is blocked or required data is missing, do not use done; keep progressing or let critic classify blocked/failed after an attempted step.",
+      "If the task is blocked or required data is missing, do not use done; keep the step minimal and let the critic classify blocked/failed after the attempt.",
       "Use observation.html as primary context; use observation.vision only when present.",
       "Choose the smallest useful next step, not a whole plan.",
     ].join(" "),
@@ -163,16 +199,6 @@ export async function planNextAction(
 
 /**
  * Asks the critic model to judge the last executed step.
- *
- * Uses:
- * - `before` / `after` observations,
- * - The `action` we attempted,
- * - `executionResult` text (success message or error string from `executeAction`),
- * - Recent `history` for context.
- *
- * The returned `status` tells `agent.ts` whether to keep looping or return success/failure.
- *
- * @param thread — Critic’s `JsonThread` (not the planner’s).
  */
 export async function critiqueStep(
   thread: JsonThread,
@@ -183,6 +209,17 @@ export async function critiqueStep(
   after: ObservationBundle,
   history: StepRecord[]
 ): Promise<CriticVerdict> {
+  const blocker = detectHardBlockers(after) ?? detectHardBlockers(before);
+
+  if (blocker) {
+    return {
+      status: "blocked",
+      summary: blocker,
+      goalProgress: "A hard verification or access blocker is preventing further progress.",
+      nextAdvice: "Stop and require a human or another approved flow instead of retrying.",
+    };
+  }
+
   return await thread.ask<CriticVerdict>({
     schemaName: "browser_step_critic",
     schema: criticSchema as unknown as Record<string, unknown>,
@@ -217,12 +254,7 @@ export async function critiqueStep(
 }
 
 /**
- * Programmatic guardrails **after** the model returns JSON but **before** Playwright runs.
- * Catches incomplete actions that still satisfied the JSON schema.
- *
- * @param action — Parsed `PlannedAction` from the planner.
- * @param task — Used to verify `credentialKey` exists in `task.credentials`.
- * @throws Error describing what was missing or inconsistent.
+ * Programmatic guardrails after the model returns JSON but before Playwright runs.
  */
 function validateAction(action: PlannedAction, task: AgentTask) {
   if (!action.reason) throw new Error("Action missing reason");
@@ -231,7 +263,11 @@ function validateAction(action: PlannedAction, task: AgentTask) {
     throw new Error("goto action missing url");
   }
 
-  if (action.actionType === "click" && action.executionMode !== "vision" && !action.selector) {
+  if (
+    action.actionType === "click" &&
+    action.executionMode !== "vision" &&
+    !action.selector
+  ) {
     throw new Error("click action missing selector");
   }
 
@@ -239,8 +275,6 @@ function validateAction(action: PlannedAction, task: AgentTask) {
     if (!action.key) {
       throw new Error("press action missing key");
     }
-    // Allow global key events without a selector for keyboard-driven interactions
-    // (e.g. pressing Enter from the currently focused element).
     if (action.selector && typeof action.selector !== "string") {
       throw new Error("press action selector must be a string when provided");
     }

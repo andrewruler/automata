@@ -501,7 +501,16 @@ export async function executeAction(
       await page.goto(action.url!, { waitUntil: "domcontentloaded", timeout: 30000 });
       break;
     }
-
+    // Add to your executeAction method
+async executeAction(page: Page, action: any): Promise<void> {
+  // Check if action indicates captcha
+  if (action.status === 'captcha_detected') {
+    throw new Error('CaptchaDetected');
+  }
+  
+  // Your existing execution logic
+  // ...
+}
     case "click": {
       if (action.executionMode === "vision") {
         logger.log(`click: vision (${action.reason})`);

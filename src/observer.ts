@@ -15,9 +15,9 @@ import { PageObservation } from "./types.js";
 /**
  * Captures a structured, size-limited text view of the current page for the planner/critic.
  *
- * Implementation note: the big callback passed to `page.evaluate` runs in the **page’s JavaScript
+ * Implementation note: the big callback passed to `page.evaluate` runs in the **page's JavaScript
  * world**, not in Node. It cannot close over Node variables unless you pass them as arguments
- * to `evaluate` (we don’t need that here).
+ * to `evaluate` (we don't need that here).
  *
  * @param page — Playwright handle to the tab being automated.
  * @returns Serializable snapshot: URL, title, lists of controls/text snippets.
@@ -28,7 +28,7 @@ export async function observePage(page: Page): Promise<PageObservation> {
     const norm = (s: string | null | undefined) =>
       (s ?? "").replace(/\s+/g, " ").trim();
 
-    /** Truncate long strings so one page doesn’t explode token usage. */
+    /** Truncate long strings so one page doesn't explode token usage. */
     const short = (s: string | null | undefined, n = 140) =>
       norm(s).slice(0, n);
 
@@ -37,7 +37,7 @@ export async function observePage(page: Page): Promise<PageObservation> {
 
     /**
      * Tries to find a human-readable label for an input (associated `<label>` or wrapping label).
-     * Helps the model match “Email” fields even when placeholder is empty.
+     * Helps the model match "Email" fields even when placeholder is empty.
      */
     const labelFor = (el: Element): string => {
       const id = el.getAttribute("id");
@@ -119,4 +119,57 @@ export async function observePage(page: Page): Promise<PageObservation> {
       bodyTextExcerpt,
     };
   });
+}
+
+/**
+ * Detects if a captcha is present on the current page.
+ */
+export async function detectCaptcha(page: Page): Promise<boolean> {
+  const captchaSelectors = [
+    'iframe[src*="recaptcha"]',
+    'iframe[src*="captcha"]',
+    '.captcha',
+    '[id*="captcha"]',
+    'img[alt*="captcha" i]',
+    '[class*="captcha"]'
+  ];
+  
+  for (const selector of captchaSelectors) {
+    const element = await page.$(selector);
+    if (element) return true;
+  }
+  
+  return false;
+}
+
+/**
+ * Captures a screenshot of the captcha area for analysis.
+ */
+export async function captureCaptchaArea(page: Page): Promise<Buffer | null> {
+  try {
+    // Try to find captcha element
+    const captchaElement = await page.$('iframe[src*="recaptcha"], .captcha, [id*="captcha"]');
+    
+    if (captchaElement) {
+      // Get bounding box
+      const bbox = await captchaElement.boundingBox();
+      if (bbox) {
+        // Crop screenshot to captcha area with some padding
+        return await page.screenshot({
+          clip: {
+            x: Math.max(0, bbox.x - 20),
+            y: Math.max(0, bbox.y - 20),
+            width: bbox.width + 40,
+            height: bbox.height + 40
+          }
+        });
+      }
+    }
+    
+    // Fallback to full page screenshot
+    return await page.screenshot();
+  } catch (error) {
+    console.error('Failed to capture captcha area:', error);
+    return null;
+  }
 }
