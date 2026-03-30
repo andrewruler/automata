@@ -39,11 +39,12 @@ export async function buildObservationBundle(
   page: Page,
   logger: Logger,
   step: number,
-  stage: "before" | "after"
+  stage: "before" | "after",
+  forceVision = false
 ): Promise<ObservationBundle> {
   const html = await observePage(page);
   const mode = visionMode();
-  if (mode !== "every") {
+  if (mode !== "every" && !forceVision) {
     return { html };
   }
   const vision = await captureVisionFrame(page, logger, `vision-${stage}-step-${step}-${Date.now()}`);

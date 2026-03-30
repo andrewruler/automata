@@ -31,6 +31,7 @@ npm start -- "Create Render web service and add env vars"
 
 Set `ALLOWED_DOMAINS` in `.env` (required) and optionally `START_URL`.
 Phase C starter supports `VISION_MODE=off|every|fallback` (`every` captures viewport screenshots into observation payload metadata).
+Phase E coordinate accuracy is now enabled with environment options `VISION_CLICK_RETRIES` (default 3) and `VISION_CLICK_JITTER_PX` (default 4), plus a hybrid `elementFromPoint` fallback for vision clicks.
 
 ## Coding lane (scaffold)
 

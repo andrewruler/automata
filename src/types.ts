@@ -78,17 +78,33 @@ export type ObservationBundle = {
   vision?: VisionFrame;
 };
 
+export type NormalizedRect = {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+};
+
+export type NormalizedPoint = {
+  x: number;
+  y: number;
+};
+
 /**
  * One step requested by the planner. `executor.ts` dispatches on `actionType`.
  *
  * - `selector`: Playwright locator string (CSS / text / role — see planner instructions).
  * - `credentialKey`: must exist in `task.credentials`; actual value filled locally.
+ * - `executionMode` and normalized coordinates allow vision-guided clicks when DOM selectors are unreliable.
  */
 export type PlannedAction = {
   actionType: "goto" | "click" | "fill" | "press" | "wait" | "done";
   reason: string;
   url?: string;
   selector?: string;
+  executionMode?: "dom" | "vision";
+  bbox?: NormalizedRect;
+  clickPoint?: NormalizedPoint;
   credentialKey?: string;
   text?: string;
   key?: string;

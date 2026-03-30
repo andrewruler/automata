@@ -16,6 +16,139 @@ import { ensureAllowedUrl } from "./guardrails.js";
 
 const ACTION_TIMEOUT_MS = 5000;
 
+async function getViewportSize(page: Page): Promise<{ width: number; height: number }> {
+  const viewport = page.viewportSize();
+  if (viewport) return viewport;
+  return await page.evaluate(() => ({
+    width: window.innerWidth || 1280,
+    height: window.innerHeight || 720,
+  }));
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function normalizedPointToViewport(point: { x: number; y: number }, viewport: { width: number; height: number }) {
+  return {
+    x: clamp(Math.round(point.x * viewport.width), 0, viewport.width - 1),
+    y: clamp(Math.round(point.y * viewport.height), 0, viewport.height - 1),
+  };
+}
+
+function bboxCenterToViewport(bbox: { x1: number; y1: number; x2: number; y2: number }, viewport: { width: number; height: number }) {
+  return normalizedPointToViewport(
+    { x: (bbox.x1 + bbox.x2) / 2, y: (bbox.y1 + bbox.y2) / 2 },
+    viewport
+  );
+}
+
+function jitterOffsets(radiusPx: number): Array<{ dx: number; dy: number }> {
+  return [
+    { dx: 0, dy: 0 },
+    { dx: -radiusPx, dy: 0 },
+    { dx: radiusPx, dy: 0 },
+    { dx: 0, dy: -radiusPx },
+    { dx: 0, dy: radiusPx },
+  ];
+}
+
+async function clickElementFromPoint(page: Page, x: number, y: number): Promise<boolean> {
+  return await page.evaluate(
+    ({ clickX, clickY }: { clickX: number; clickY: number }) => {
+      const element = document.elementFromPoint(clickX, clickY);
+      if (!element || !(element instanceof HTMLElement)) return false;
+      element.scrollIntoView({ block: "center", inline: "center", behavior: "auto" });
+      const rect = element.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      const ev = new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+        view: window,
+        clientX: centerX,
+        clientY: centerY,
+      });
+      element.dispatchEvent(ev);
+      return true;
+    },
+    { clickX: x, clickY: y }
+  );
+}
+
+async function clickByVision(page: Page, action: PlannedAction): Promise<string> {
+  const viewport = await getViewportSize(page);
+  const basePoint = action.clickPoint
+    ? normalizedPointToViewport(action.clickPoint, viewport)
+    : action.bbox
+    ? bboxCenterToViewport(action.bbox, viewport)
+    : null;
+
+  if (!basePoint) {
+    throw new Error("Vision click requires bbox or clickPoint");
+  }
+
+  const maxRetries = Number(process.env.VISION_CLICK_RETRIES ?? "3");
+  const jitterPx = Number(process.env.VISION_CLICK_JITTER_PX ?? "4");
+  const candidates = jitterOffsets(jitterPx).map((offset) => ({
+    x: clamp(basePoint.x + offset.dx, 0, viewport.width - 1),
+    y: clamp(basePoint.y + offset.dy, 0, viewport.height - 1),
+  }));
+
+  const startUrl = page.url();
+
+  for (let i = 0; i < Math.min(maxRetries, candidates.length); i++) {
+    const { x, y } = candidates[i];
+
+    try {
+      await page.mouse.move(x, y, { steps: 12 });
+      await page.mouse.click(x, y);
+      await page.waitForTimeout(300);
+
+      const currentUrl = page.url();
+      if (currentUrl !== startUrl) {
+        return `click:vision (mouse ${i + 1} of ${maxRetries})`;
+      }
+
+      // Fallback to DOM click via elementFromPoint if the mouse click did not change URL.
+      const domClicked = await clickElementFromPoint(page, x, y);
+      if (domClicked) {
+        await page.waitForTimeout(300);
+        if (page.url() !== startUrl) {
+          return `click:vision (elementFromPoint fallback ${i + 1} of ${maxRetries})`;
+        }
+        return `click:vision (elementFromPoint ${i + 1} of ${maxRetries})`;
+      }
+
+      // If we reach here, the click did not visibly navigate; continue to next candidate.
+    } catch (err) {
+      void err;
+    }
+  }
+
+  throw new Error(`Vision click failed after ${maxRetries} attempts (base point ${basePoint.x},${basePoint.y})`);
+}
+
+async function selectFirstDropdownOptionIfVisible(page: Page): Promise<boolean> {
+  const chosen = await page.evaluate(() => {
+    const options = Array.from(document.querySelectorAll('li[role="option"], [role="option"]'))
+      .filter((el) => {
+        if (!(el instanceof HTMLElement)) return false;
+        const style = window.getComputedStyle(el);
+        const rect = el.getBoundingClientRect();
+        return style.visibility !== "hidden" && style.display !== "none" && rect.width > 0 && rect.height > 0;
+      });
+    if (options.length === 0) return false;
+    (options[0] as HTMLElement).click();
+    return true;
+  });
+
+  if (chosen) {
+    await page.waitForTimeout(300);
+  }
+  return chosen;
+}
+
 async function tryGoogleSignupOptionSelect(page: Page, wantedText: string): Promise<boolean> {
   return await page.evaluate((wantedRaw) => {
     if (!location.hostname.includes("accounts.google.com")) return false;
@@ -83,8 +216,15 @@ async function clickWithFallbacks(page: Page, selector: string): Promise<string>
   if (selectorLower.includes("text=month")) {
     const opened = await tryGoogleSignupOpenDropdown(page, "month");
     if (opened) return "click:google-open-month";
-  }
-  if (selectorLower.startsWith("text=")) {
+  }  if (
+    selectorLower.includes('aria-label="month"') ||
+    selectorLower.includes("aria-label='month'") ||
+    (selectorLower.includes("role=\"combobox\"") && selectorLower.includes("month")) ||
+    selectorLower.includes("input[aria-label=\"month\"]")
+  ) {
+    const opened = await tryGoogleSignupOpenDropdown(page, "month");
+    if (opened) return "click:google-open-month";
+  }  if (selectorLower.startsWith("text=")) {
     const wanted = selector.slice(5).trim().replace(/^["']|["']$/g, "");
     const googleOptionSelected = await tryGoogleSignupOptionSelect(page, wanted);
     if (googleOptionSelected) return "click:google-option-select";
@@ -202,6 +342,62 @@ function isOverGenericFillSelector(selector: string): boolean {
   );
 }
 
+async function refineGenericFillSelector(page: Page, selector: string): Promise<string | null> {
+  return await page.evaluate((rawSelector) => {
+    const sel = rawSelector.trim();
+    const element = document.querySelector(sel);
+    if (!(element instanceof HTMLElement)) return null;
+    const tag = element.tagName.toLowerCase();
+    if (tag !== "input" && tag !== "textarea" && !element.isContentEditable) return null;
+
+    const isVisible = (el: Element | null): el is HTMLElement => {
+      if (!(el instanceof HTMLElement)) return false;
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      return rect.width > 0 && rect.height > 0 && style.visibility !== "hidden" && style.display !== "none";
+    };
+
+    const attrs: Array<[string, string | null]> = [
+      ["name", element.getAttribute("name")],
+      ["id", element.getAttribute("id")],
+      ["placeholder", element.getAttribute("placeholder")],
+      ["aria-label", element.getAttribute("aria-label")],
+      ["autocomplete", element.getAttribute("autocomplete")],
+      ["data-testid", element.getAttribute("data-testid")],
+    ];
+
+    const candidates: string[] = [];
+    for (const [attr, value] of attrs) {
+      if (value && value.trim()) {
+        const quoted = JSON.stringify(value.trim());
+        candidates.push(`${sel}[${attr}=${quoted}]`);
+      }
+    }
+
+    if (element.id) {
+      const labels = Array.from(document.querySelectorAll(`label[for=${JSON.stringify(element.id)}]`));
+      for (const label of labels) {
+        if (!(label instanceof HTMLElement)) continue;
+        const text = (label.textContent || "").trim();
+        if (text) {
+          const quoted = JSON.stringify(text);
+          candidates.push(`${sel}[aria-label=${quoted}]`);
+        }
+      }
+    }
+
+    const visibleMatches = Array.from(document.querySelectorAll(sel)).filter(isVisible);
+    if (visibleMatches.length === 1) return sel;
+
+    for (const candidate of candidates) {
+      const matches = Array.from(document.querySelectorAll(candidate)).filter(isVisible);
+      if (matches.length === 1) return candidate;
+    }
+
+    return null;
+  }, selector);
+}
+
 async function fillWithFallbacks(page: Page, selector: string, value: string): Promise<string> {
   const target = page.locator(selector).first();
 
@@ -307,9 +503,15 @@ export async function executeAction(
     }
 
     case "click": {
-      logger.log(`click: ${action.selector} (${action.reason})`);
-      const strategy = await clickWithFallbacks(page, action.selector!);
-      logger.log(`click strategy used: ${strategy}`);
+      if (action.executionMode === "vision") {
+        logger.log(`click: vision (${action.reason})`);
+        const strategy = await clickByVision(page, action);
+        logger.log(`click strategy used: ${strategy}`);
+      } else {
+        logger.log(`click: ${action.selector} (${action.reason})`);
+        const strategy = await clickWithFallbacks(page, action.selector!);
+        logger.log(`click strategy used: ${strategy}`);
+      }
       await settle(page);
       break;
     }
@@ -320,8 +522,9 @@ export async function executeAction(
           ? task.credentials?.[action.credentialKey] ?? ""
           : action.text ?? "";
 
+      let selector = action.selector!;
       logger.log(
-        `fill: ${action.selector} using ${
+        `fill: ${selector} using ${
           action.credentialKey ? `credential:${action.credentialKey}` : "literal text"
         } (${action.reason})`
       );
@@ -330,20 +533,48 @@ export async function executeAction(
         throw new Error("Resolved fill value is empty");
       }
 
-      if (isOverGenericFillSelector(action.selector!)) {
-        throw new Error(
-          `Refusing overly generic fill selector: ${action.selector}. Choose a specific field selector.`
-        );
+      if (isOverGenericFillSelector(selector)) {
+        const refined = await refineGenericFillSelector(page, selector);
+        if (refined) {
+          logger.log(`refined generic fill selector to: ${refined}`);
+          selector = refined;
+        } else {
+          throw new Error(
+            `Refusing overly generic fill selector: ${selector}. Choose a specific field selector.`
+          );
+        }
       }
 
-      const strategy = await fillWithFallbacks(page, action.selector!, value);
+      const strategy = await fillWithFallbacks(page, selector, value);
       logger.log(`fill strategy used: ${strategy}`);
       break;
     }
 
     case "press": {
-      logger.log(`press: ${action.key} on ${action.selector} (${action.reason})`);
-      await page.locator(action.selector!).first().press(action.key!, { timeout: ACTION_TIMEOUT_MS });
+      if (action.selector) {
+        logger.log(`press: ${action.key} on ${action.selector} (${action.reason})`);
+        const wasDropdown = /gender|month|day|year|month|combobox/i.test(action.selector);
+        if (wasDropdown && (action.key === "ArrowDown" || action.key === "ArrowUp" || action.key === "Enter")) {
+          const selected = await selectFirstDropdownOptionIfVisible(page);
+          if (selected) {
+            logger.log(`press: selected first visible dropdown option for ${action.selector}`);
+            await settle(page);
+            break;
+          }
+        }
+        await page.locator(action.selector).first().press(action.key!, { timeout: ACTION_TIMEOUT_MS });
+      } else {
+        logger.log(`press: ${action.key} on page keyboard (${action.reason})`);
+        if (action.key === "ArrowDown" || action.key === "ArrowUp" || action.key === "Enter") {
+          const selected = await selectFirstDropdownOptionIfVisible(page);
+          if (selected) {
+            logger.log(`press: selected first visible dropdown option via global action ${action.key}`);
+            await settle(page);
+            break;
+          }
+        }
+        await page.keyboard.press(action.key!, { delay: 10 });
+      }
       await settle(page);
       break;
     }

@@ -47,6 +47,12 @@ function classifyDoneMessage(message: string): boolean {
   return !blockedSignals.some((signal) => text.includes(signal));
 }
 
+function needsFallbackVision(history: StepRecord[]): boolean {
+  if (history.length === 0) return false;
+  const last = history[history.length - 1];
+  return last.result.startsWith("Execution error:");
+}
+
 function actionSignature(action: { actionType: string; selector?: string; url?: string }): string {
   return `${action.actionType}|${action.selector ?? ""}|${action.url ?? ""}`;
 }
@@ -105,8 +111,9 @@ export async function runLLMAgentTask(task: AgentTask): Promise<ExecutionResult>
     // MAIN LOOP — each pass is one “agent step” (may include LLM + browser)
     // =================================================================
     for (let step = 1; step <= task.maxSteps && Date.now() < deadline; step++) {
-      // --- (1) Perceive: structured text snapshot of the current DOM (no screenshots here yet) ---
-      const before = await buildObservationBundle(page, logger, step, "before");
+      // --- (1) Perceive: structured text snapshot of the current DOM (with optional vision fallback) ---
+      const forceVision = needsFallbackVision(history) && (process.env.VISION_MODE ?? "off").trim().toLowerCase() === "fallback";
+      const before = await buildObservationBundle(page, logger, step, "before", forceVision);
 
       // --- (2) Decide: ask planner for exactly one JSON action ---
       const action = await planNextAction(planner, task, before, history);
@@ -158,7 +165,10 @@ export async function runLLMAgentTask(task: AgentTask): Promise<ExecutionResult>
       }
 
       // --- (4) Perceive again: see what changed after the action ---
-      const after = await buildObservationBundle(page, logger, step, "after");
+      const afterForceVision =
+        (process.env.VISION_MODE ?? "off").trim().toLowerCase() === "every" ||
+        ((process.env.VISION_MODE ?? "off").trim().toLowerCase() === "fallback" && execMessage.startsWith("Execution error:"));
+      const after = await buildObservationBundle(page, logger, step, "after", afterForceVision);
 
       // --- (5) Review: second LLM call scores the step ---
       const verdict = await critiqueStep(

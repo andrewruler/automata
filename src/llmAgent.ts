@@ -32,6 +32,27 @@ const actionSchema = {
     reason: { type: "string" },
     url: { type: ["string", "null"] },
     selector: { type: ["string", "null"] },
+    executionMode: { type: ["string", "null"], enum: ["dom", "vision", null] },
+    bbox: {
+      type: ["object", "null"],
+      properties: {
+        x1: { type: "number", minimum: 0, maximum: 1 },
+        y1: { type: "number", minimum: 0, maximum: 1 },
+        x2: { type: "number", minimum: 0, maximum: 1 },
+        y2: { type: "number", minimum: 0, maximum: 1 },
+      },
+      required: ["x1", "y1", "x2", "y2"],
+      additionalProperties: false,
+    },
+    clickPoint: {
+      type: ["object", "null"],
+      properties: {
+        x: { type: "number", minimum: 0, maximum: 1 },
+        y: { type: "number", minimum: 0, maximum: 1 },
+      },
+      required: ["x", "y"],
+      additionalProperties: false,
+    },
     credentialKey: { type: ["string", "null"] },
     text: { type: ["string", "null"] },
     key: { type: ["string", "null"] },
@@ -43,6 +64,9 @@ const actionSchema = {
     "reason",
     "url",
     "selector",
+    "executionMode",
+    "bbox",
+    "clickPoint",
     "credentialKey",
     "text",
     "key",
@@ -102,6 +126,10 @@ export async function planNextAction(
       "Prefer robust Playwright locator strings using visible text, name, placeholder, data-testid, or simple CSS selectors.",
       'Examples: button:has-text("Sign up"), input[name="email"], [data-testid="submit"].',
       'For fill actions, avoid generic selectors like input[type="text"] or input[type="text"]:not([name]); choose specific field selectors using name, aria-label, placeholder, label context, role, or data-* attributes.',
+      'Prefer DOM selector (`executionMode: "dom"`) when page structure is clear. Use vision mode (`executionMode: "vision"`) only for hard-to-select elements where a screenshot and normalized bbox/clickPoint are more reliable.',
+      'When performing dropdown or combobox interaction, prefer explicit `click` actions on option items (e.g., `click text=Female`) over low-level `press` action keys when possible.',
+      'Avoid using undesired global focus commands such as ArrowUp/ArrowDown/Enter unless the target element is clearly a keyboard-navigable combobox and no stable options are available.',
+      'When using vision mode, include normalized coordinates in `bbox` or `clickPoint` (values 0–1 relative to viewport width/height).',
       "Do not invent elements that are not plausibly present in the observation.",
       "Use actionType='done' only when the task is truly complete.",
       "If the task is blocked or required data is missing, do not use done; keep progressing or let critic classify blocked/failed after an attempted step.",
@@ -203,15 +231,19 @@ function validateAction(action: PlannedAction, task: AgentTask) {
     throw new Error("goto action missing url");
   }
 
-  if (
-    (action.actionType === "click" || action.actionType === "press") &&
-    !action.selector
-  ) {
-    throw new Error(`${action.actionType} action missing selector`);
+  if (action.actionType === "click" && action.executionMode !== "vision" && !action.selector) {
+    throw new Error("click action missing selector");
   }
 
-  if (action.actionType === "press" && !action.key) {
-    throw new Error("press action missing key");
+  if (action.actionType === "press") {
+    if (!action.key) {
+      throw new Error("press action missing key");
+    }
+    // Allow global key events without a selector for keyboard-driven interactions
+    // (e.g. pressing Enter from the currently focused element).
+    if (action.selector && typeof action.selector !== "string") {
+      throw new Error("press action selector must be a string when provided");
+    }
   }
 
   if (action.actionType === "fill") {
@@ -224,6 +256,20 @@ function validateAction(action: PlannedAction, task: AgentTask) {
       !(task.credentials && action.credentialKey in task.credentials)
     ) {
       throw new Error(`Unknown credentialKey: ${action.credentialKey}`);
+    }
+  }
+
+  if (action.executionMode) {
+    if (action.executionMode !== "dom" && action.executionMode !== "vision") {
+      throw new Error(`Invalid executionMode: ${action.executionMode}`);
+    }
+    if (action.executionMode === "vision") {
+      if (action.actionType !== "click") {
+        throw new Error("vision executionMode is only supported for click actions");
+      }
+      if (!action.bbox && !action.clickPoint) {
+        throw new Error("vision click actions require bbox or clickPoint");
+      }
     }
   }
 
